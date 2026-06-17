@@ -23,7 +23,7 @@ QTY = 1
 
 
 # ========== 购买人配置 ==========
-BUYER_IDS = ['6417174']
+BUYER_IDS = ['']
 BUYER_INFO = [
 ]
 CONTACT_INFO = {
@@ -33,14 +33,15 @@ CONTACT_INFO = {
 
 
 # 重试延迟配置（毫秒）
-PREP_RETRY_DELAY_MS = 500
-PURC_RETRY_DELAY_MS = 800
+PREP_RETRY_DELAY_MS = 300
+PURC_RETRY_DELAY_MS = 300
 
 # 停止码
 PREP_STOP_CODES = {100048, 100079}  # 抢票成功
 PREP_END_CODES = {100005, 100004, 212, 216}  # 活动结束
-PREP_RETRY_CODES = {100051, 100034, 100049, 100050}  # 需要重试
+PREP_RETRY_CODES = {100051, 100034,900001}  # 需要重试
 PREP_REFRESH_CODES = {100009}  # 库存不足，刷新
+PREP_RESTART_CODES = {100049, 100050}  # 需要退回详情页，从prep重新开始
 
 PURC_STOP_CODES = {100048, 100079}  # 抢票成功（支付页）
 PURC_END_CODES = {100005, 100004, 212, 216}  # 活动结束
@@ -95,7 +96,7 @@ def check_is_paying(tab):
 def run_prep(tab, project_id, screen_id, ticket_id, qty):
     """
     执行 prep 阶段，监听数据包获取结果
-    返回: ('success', url) | ('retry', None) | ('refresh', None) | ('stop', msg) | ('end', msg)
+    返回: ('success', url) | ('retry', None) | ('refresh', None) | ('restart', None) | ('stop', msg) | ('end', msg)
     """
     # 启动监听 prep API
     tab.listen.start('show.bilibili.com/api/ticket/order/prepare')
@@ -182,6 +183,11 @@ def run_prep(tab, project_id, screen_id, ticket_id, qty):
     if errno in PREP_REFRESH_CODES:
         print(f"🔄 [prep] 库存不足 errno={errno}，刷新库存...")
         return 'refresh', None
+
+    # 需要退回详情页重新开始的码
+    if errno in PREP_RESTART_CODES:
+        print(f"🔄 [prep] 需要重新开始 errno={errno}，退回详情页...")
+        return 'restart', None
 
     # 需要重试的码
     if errno in PREP_RETRY_CODES:
@@ -375,6 +381,13 @@ def main():
             print(f"当前URL: {tab.url}")
             print("请尽快完成支付！")
             break
+        elif status == 'restart':
+            # 退回详情页，重新加载prep JS，从头开始完整流程
+            print(f"⬅️ 退回详情页，重新加载...")
+            tab.get(f'https://show.bilibili.com/platform/detail.html?id={PROJECT_ID}')
+            load_js(tab, './js/ticket_prep.js')
+            ms_sleep(PREP_RETRY_DELAY_MS)
+            continue
         elif status == 'end':
             print(f"\n❌ {data}")
             break

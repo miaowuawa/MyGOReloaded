@@ -1,11 +1,17 @@
 // ===== B站票务 - 纯请求工具 (prep) =====
 // 职责：在浏览器环境内执行 prep 请求，返回原始响应
-// 不处理重试、不弹窗、不跳转，Python 通过监听数据包获取结果
+// 后台持续扫描重试按钮，自动点击，消失后自动重新获取 VM
 
 (function() {
     'use strict';
 
-    // ---------- 扫描匿名vm组件 ----------
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    // ========== VM 管理 ==========
+    let vm = null;
+    let vmReady = false;
+    let retryScannerRunning = false;
+
     function scanVm() {
         const app = document.querySelector('#app')?.__vue_app__;
         if (!app) return null;
@@ -40,21 +46,110 @@
         return found;
     }
 
-    const vm = scanVm();
-    if (!vm) {
-        console.error('[prep] vm未找到');
+    function acquireVm() {
+        const newVm = scanVm();
+        if (newVm) {
+            vm = newVm;
+            window._ticketVm = vm;
+            vmReady = true;
+            console.log('[prep] VM 已获取');
+            return true;
+        }
+        return false;
+    }
+
+    // 初始获取
+    if (!acquireVm()) {
+        console.error('[prep] 初始 VM 获取失败');
         return;
     }
-    window._ticketVm = vm;
+
+    // ========== 后台重试按钮扫描器 ==========
+    async function startRetryScanner() {
+        if (retryScannerRunning) return;
+        retryScannerRunning = true;
+        console.log('[prep] 重试按钮扫描器启动');
+
+        while (retryScannerRunning) {
+            const btn = document.querySelector('.bili-button-container.bili-button.bili-button-type-primary.bili-button-size-normal.retry-btn');
+
+            if (!btn) {
+                // 没有按钮，正常轮询
+                await sleep(100);
+                continue;
+            }
+
+            // 发现按钮，开始持续点击
+            console.log('[prep] 发现重试按钮，开始自动点击');
+            let clickCount = 0;
+
+            while (retryScannerRunning) {
+                const currentBtn = document.querySelector('.bili-button-container.bili-button.bili-button-type-primary.bili-button-size-normal.retry-btn');
+                if (!currentBtn) {
+                    console.log('[prep] 重试按钮已消失，重新获取 VM...');
+                    vmReady = false;
+                    // 持续尝试重新获取 VM，直到成功
+                    let reacquireAttempts = 0;
+                    while (retryScannerRunning && !vmReady) {
+                        if (acquireVm()) {
+                            console.log('[prep] VM 重新获取成功');
+                            break;
+                        }
+                        reacquireAttempts++;
+                        if (reacquireAttempts % 10 === 0) {
+                            console.log(`[prep] VM 重新获取中... (${reacquireAttempts}次)`);
+                        }
+                        await sleep(100);
+                    }
+                    break; // 跳出点击循环，回到外层扫描
+                }
+
+                currentBtn.click();
+                clickCount++;
+                if (clickCount % 5 === 0) {
+                    console.log(`[prep] 已点击重试按钮 ${clickCount} 次`);
+                }
+                await sleep(50); // 快速点击间隔
+            }
+        }
+    }
+
+    // 启动后台扫描器
+    startRetryScanner();
+
+    // ========== 对外接口 ==========
+
+    /**
+     * 等待 VM 就绪（prepRequest 调用前使用）
+     */
+    window.waitForVm = async function(timeout = 10000) {
+        const start = Date.now();
+        while (!vmReady && Date.now() - start < timeout) {
+            await sleep(50);
+        }
+        return vmReady;
+    };
+
+    /**
+     * 重新获取 VM（外部调用）
+     */
+    window.reacquireVm = function() {
+        return acquireVm();
+    };
 
     /**
      * 执行 prep 请求
-     * @param {Object} opt
-     * @returns {Promise<Object>} 原始响应对象
      */
     window.prepRequest = async function(opt = {}) {
-        const vm = window._ticketVm;
-        if (!vm) throw new Error('vm未找到');
+        // 等待 VM 就绪（可能被重试按钮扫描器置为 false）
+        if (!vmReady) {
+            console.log('[prep] 等待 VM 就绪...');
+            const ok = await window.waitForVm(15000);
+            if (!ok) throw new Error('VM 未就绪');
+        }
+
+        const currentVm = window._ticketVm;
+        if (!currentVm) throw new Error('vm未找到');
 
         const {
             projectId,
@@ -66,16 +161,16 @@
             buyerInfo = ''
         } = opt;
 
-        const pid = projectId !== undefined ? projectId : vm.projectInfo?.id;
-        const tok = token !== undefined ? token : (vm.verifyToken || '');
+        const pid = projectId !== undefined ? projectId : currentVm.projectInfo?.id;
+        const tok = token !== undefined ? token : (currentVm.verifyToken || '');
 
         if (!pid) throw new Error('projectId为空');
         if (!screenId) throw new Error('screenId为空');
         if (!ticketId) throw new Error('ticketId为空');
 
-        vm.currentScreenId = screenId;
-        vm.currentTicketId = ticketId;
-        vm.qty = qty;
+        currentVm.currentScreenId = screenId;
+        currentVm.currentTicketId = ticketId;
+        currentVm.qty = qty;
 
         const params = {
             project_id: pid,
@@ -89,16 +184,13 @@
             ignoreRequestLimit: true
         };
 
-        // 直接调用 vm 方法，让请求走浏览器正常网络栈（可被 Python 监听）
-        const res = await vm.pepareWithRefreshStock(params);
+        const res = await currentVm.pepareWithRefreshStock(params);
         console.log('[prep] 响应:', res);
         return res;
     };
 
     /**
      * 刷新库存信息
-     * @param {string|number} projectId
-     * @returns {Promise<Object>}
      */
     window.refreshStock = async function(projectId) {
         const url = `https://show.bilibili.com/api/ticket/project/getV2?id=${projectId}&project_id=${projectId}&requestSource=neul-next`;
@@ -112,5 +204,5 @@
         return await res.json();
     };
 
-    console.log('[prep] 已加载，调用: prepRequest({screenId, ticketId, qty})');
+    console.log('[prep] 已加载，后台扫描器运行中');
 })();

@@ -156,6 +156,17 @@
         vm.selectedStatus = false;
         vm.projectOffLineStatus = false;
         vm.ptStatus = false;
+
+        // 隐藏"前方拥挤"弹窗容器
+        const limitContainer = document.querySelector('.bili-request-limit-container');
+        if (limitContainer) {
+            limitContainer.style.cssText = 'visibility:hidden !important;display:none !important;opacity:0 !important;pointer-events:none !important;';
+            limitContainer.querySelectorAll('*').forEach(el => {
+                el.style.cssText = 'visibility:hidden !important;display:none !important;';
+            });
+            console.log('[purc] 已隐藏拥挤弹窗');
+        }
+
         console.log('[purc] 已重置弹窗状态');
     }
 
