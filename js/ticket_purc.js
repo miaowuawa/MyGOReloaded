@@ -24,16 +24,22 @@
         return null;
     }
 
-    async function getVm() {
-        const startTime = Date.now();
-        const deadline = startTime + 300;
-        while (Date.now() < deadline) {
+    async function getVm(maxRetries = 100) {
+        let attempts = 0;
+        while (attempts < maxRetries) {
             const vm = findVueInstance();
             if (vm && vm.detail && !vm.initLoading) {
                 window._orderVm = vm;
+                console.log('[purc] VM 已获取');
                 return vm;
             }
+            attempts++;
+            if (attempts % 20 === 0) {
+                console.log(`[purc] VM获取中... (${attempts}/${maxRetries})`);
+            }
+            await sleep(100);
         }
+        console.error('[purc] VM 获取失败，已达最大重试次数');
         return null;
     }
 

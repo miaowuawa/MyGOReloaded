@@ -46,23 +46,29 @@
         return found;
     }
 
-    function acquireVm() {
-        const newVm = scanVm();
-        if (newVm) {
-            vm = newVm;
-            window._ticketVm = vm;
-            vmReady = true;
-            console.log('[prep] VM 已获取');
-            return true;
+    async function acquireVmWithRetry(maxRetries = 100) {
+        let attempts = 0;
+        while (attempts < maxRetries) {
+            const newVm = scanVm();
+            if (newVm) {
+                vm = newVm;
+                window._ticketVm = vm;
+                vmReady = true;
+                console.log('[prep] VM 已获取');
+                return true;
+            }
+            attempts++;
+            if (attempts % 10 === 0) {
+                console.log(`[prep] VM获取中... (${attempts}/${maxRetries})`);
+            }
+            await sleep(100);
         }
+        console.error('[prep] VM 获取失败，已达最大重试次数');
         return false;
     }
 
-    // 初始获取
-    if (!acquireVm()) {
-        console.error('[prep] 初始 VM 获取失败');
-        return;
-    }
+    // 初始获取 - 使用重试机制
+    acquireVmWithRetry();
 
     // ========== 后台重试按钮扫描器 ==========
     async function startRetryScanner() {
@@ -131,10 +137,11 @@
     };
 
     /**
-     * 重新获取 VM（外部调用）
+     * 重新获取 VM（外部调用）- 带重试
      */
-    window.reacquireVm = function() {
-        return acquireVm();
+    window.reacquireVm = async function(maxRetries = 50) {
+        vmReady = false;
+        return await acquireVmWithRetry(maxRetries);
     };
 
     /**
