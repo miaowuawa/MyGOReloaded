@@ -501,9 +501,12 @@ def run_prep(tab, project_id, screen_id, ticket_id, qty, debug_timing=False):
     return 'retry', None
 
 
-def run_purc(tab, buyer_info, contact_info, buyer_ids=None):
+def run_purc(tab, buyer_info, contact_info, buyer_ids=None, click_delay_ms=250):
     """
-    执行 purc 阶段，监听 createOrder 数据包
+    执行 purc 阶段。
+    JS 内部负责重试循环与点击延迟，本函数只监听 createOrder 数据包，
+    按 errno 判定是否终止（成功/停止/结束）并通知 JS 退出循环。
+
     返回: ('success', order_id) | ('retry', None) | ('stop', msg) | ('end', msg)
     """
     # 启动监听 createOrder API
@@ -512,16 +515,18 @@ def run_purc(tab, buyer_info, contact_info, buyer_ids=None):
     # 构建JS调用参数
     js_options = {
         "buyerInfo": buyer_info,
-        "contact": contact_info
+        "contact": contact_info,
+        "clickDelay": click_delay_ms
     }
-    
+
     # 如果有buyer_ids，添加到参数中
     if buyer_ids:
         js_options["buyerIds"] = buyer_ids
         print(f"[purc] 使用实名人ID: {buyer_ids}")
-    
+
     args_json = json.dumps(js_options, ensure_ascii=False)
 
+    # 启动 JS 重试循环（重试 + 点击延迟均在 JS 内）
     tab.run_js(f'''
         window._purcResult = null;
         (async function() {{
@@ -534,77 +539,87 @@ def run_purc(tab, buyer_info, contact_info, buyer_ids=None):
         }})();
     ''')
 
-    # 等待数据包或 JS 返回
-    max_wait = 15
+    # 监听 createOrder 数据包，按状态码决定终止与否
+    max_wait = 60  # JS 自行重试，这里放宽上限
     start = time.time()
-    res_data = None
+    last_errno = None
 
     while time.time() - start < max_wait:
-        # 先检查是否到支付页了
+        # 已进入支付页 = 成功
         if check_is_paying(tab):
+            window_stop_sent = _notify_purc_stop(tab)
             tab.listen.stop()
             return 'stop', '已进入支付页'
 
+        # 先看 JS 是否已主动返回（no_vm/no_buyer/异常）
         try:
-            packet = tab.listen.wait(timeout=2)
+            direct = tab.run_js('return window._purcResult;')
+            if direct:
+                status = direct.get('status')
+                if status == 'success':
+                    tab.listen.stop()
+                    return 'success', direct.get('orderId')
+                if status == 'no_buyer':
+                    tab.listen.stop()
+                    return 'end', '购买人信息不足'
+                if status == 'no_vm':
+                    tab.listen.stop()
+                    return 'retry', 'Vue实例未找到'
+                if status in ('exception', 'stopped'):
+                    # 循环被外部终止或异常，转交监听到的数据包判定
+                    pass
+        except Exception:
+            pass
+
+        # 监听 createOrder 数据包
+        try:
+            packet = tab.listen.wait(timeout=1)
             if packet and 'create' in packet.url:
                 body = packet.response.body if hasattr(packet.response, 'body') else None
                 if body:
                     res_data = parse_purc_response(body)
                     errno = res_data.get('errno') if res_data else None
+                    last_errno = errno
                     print(f"📨 [purc] 捕获数据包: errno={errno}")
-                    break
+
+                    # 命中需终止的状态码 → 通知 JS 停止重试
+                    if errno == 0:
+                        _notify_purc_stop(tab)
+                        tab.listen.stop()
+                        order_id = res_data.get('data', {}).get('order_id')
+                        print(f"🎉 [purc] 订单创建成功! order_id={order_id}")
+                        return 'success', order_id
+                    if errno in PURC_STOP_CODES:
+                        _notify_purc_stop(tab)
+                        tab.listen.stop()
+                        return 'stop', f'抢票成功 (errno={errno})'
+                    if errno in PURC_END_CODES:
+                        _notify_purc_stop(tab)
+                        tab.listen.stop()
+                        return 'end', f'活动结束 (errno={errno})'
+                    # 其他 errno: JS 继续重试，本循环继续监听
         except Exception:
             pass
 
-        # 检查 JS 直接返回
-        try:
-            direct = tab.run_js('return window._purcResult;')
-            if direct and direct.get('status') in ('success', 'error', 'timeout', 'no_buyer'):
-                status = direct.get('status')
-                if status == 'success':
-                    tab.listen.stop()
-                    return 'success', direct.get('orderId')
-                elif status == 'timeout':
-                    print("⚠️ [purc] JS 超时")
-                    break
-                elif status == 'no_buyer':
-                    tab.listen.stop()
-                    return 'end', '购买人信息不足'
-                break
-        except Exception:
-            pass
+        time.sleep(0.05)
 
-        time.sleep(0.1)
-
+    # 超时未命中终止码：通知 JS 停止，上报最后一次 errno
+    _notify_purc_stop(tab)
     tab.listen.stop()
-
-    if not res_data:
-        if check_is_paying(tab):
-            return 'stop', '已进入支付页'
-        print("⚠️ [purc] 无响应，重试...")
-        return 'retry', None
-
-    errno = res_data.get('errno')
-
-    # 成功
-    if errno == 0:
-        order_id = res_data.get('data', {}).get('order_id')
-        print(f"🎉 [purc] 订单创建成功! order_id={order_id}")
-        return 'success', order_id
-
-    # 停止码
-    if errno in PURC_STOP_CODES:
-        return 'stop', f'抢票成功 (errno={errno})'
-
-    # 结束码
-    if errno in PURC_END_CODES:
-        return 'end', f'活动结束 (errno={errno})'
-
-    # 其他重试
-    msg = res_data.get('msg', '未知错误')
-    print(f"🔄 [purc] 需要重试 errno={errno}, msg={msg}")
+    if last_errno is not None:
+        print(f"⚠️ [purc] 监听超时，最后 errno={last_errno}")
+    else:
+        print("⚠️ [purc] 无响应")
     return 'retry', None
+
+
+def _notify_purc_stop(tab):
+    """通知 JS 终止重试循环。失败不影响后续逻辑。"""
+    try:
+        tab.run_js('if (typeof window.stopPurc === "function") window.stopPurc();')
+        return True
+    except Exception:
+        return False
 
 
 def refresh_stock(tab, project_id):
@@ -743,7 +758,13 @@ def main():
     print("=" * 50)
 
     while True:
-        status, data = run_purc(tab, config['buyer_info'], config['contact_info'], config.get('buyer_ids'))
+        status, data = run_purc(
+            tab,
+            config['buyer_info'],
+            config['contact_info'],
+            config.get('buyer_ids'),
+            click_delay_ms=config['purc_retry_delay_ms'],
+        )
 
         if status == 'success':
             print(f"\n🎉🎉🎉 抢票成功！订单号: {data}")
