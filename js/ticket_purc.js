@@ -153,7 +153,7 @@
 
     // ========== 设置订单状态（绕过弹窗） ==========
     function bypassPopups(vm) {
-        // 直接重置所有弹窗标志，让 createOrder 能继续执行
+        // 直接重置所有弹窗与"已提交"标志，让 createOrder 能继续执行
         vm.isRequestLimit = false;
         vm.showErrorPage = false;
         vm.priceChange = false;
@@ -162,6 +162,11 @@
         vm.selectedStatus = false;
         vm.projectOffLineStatus = false;
         vm.ptStatus = false;
+        // createOrder 内部可能用这些标志做防抖/已提交守卫，必须清掉
+        if (vm.order_create_status !== undefined) vm.order_create_status = false;
+        if (vm.createOrderLoading !== undefined) vm.createOrderLoading = false;
+        if (vm.isCreating !== undefined) vm.isCreating = false;
+        if (vm.submitting !== undefined) vm.submitting = false;
 
         // 隐藏"前方拥挤"弹窗容器
         const limitContainer = document.querySelector('.bili-request-limit-container');
@@ -170,13 +175,15 @@
             limitContainer.querySelectorAll('*').forEach(el => {
                 el.style.cssText = 'visibility:hidden !important;display:none !important;';
             });
-            console.log('[purc] 已隐藏拥挤弹窗');
         }
 
-        console.log('[purc] 已重置弹窗状态');
+        console.log('[purc] 已重置弹窗 + 提交状态');
     }
 
     // ========== 主入口 ==========
+    // 重试循环 + 点击延迟均在 JS 内完成；
+    // DrissionPage 只监听 createOrder 数据包并按 errno 决定是否终止，
+    // 命中终止条件时 Python 将 window._purcStop 置 true，本循环退出。
     window.submitOrder = async function(options = {}) {
         const vm = await getVm();
         if (!vm) {
@@ -206,33 +213,46 @@
 
         await sleep(200);
 
-        // 4. 绕过弹窗，直接提交
-        bypassPopups(vm);
+        // 4. 重试循环（点击延迟由 JS 控制）
+        const clickDelay = (options.clickDelay && options.clickDelay > 0) ? options.clickDelay : 250;
+        window._purcStop = false;
+        window._purcAttempt = 0;
+        console.log(`[purc] 进入重试循环 (clickDelay=${clickDelay}ms)，由数据包监听决定终止`);
 
-        const event = makeClickEvent();
-        vm.createOrder(0, event);
-
-        // 5. 轮询等待结果（只读状态，不处理弹窗）
-        let retries = 60;
-        while (retries-- > 0) {
-            await sleep(500);
-
+        while (!window._purcStop) {
+            // VM 自身已生成订单
             if (vm.orderId) {
                 return { status: 'success', orderId: vm.orderId };
             }
 
-            // 只检测最终失败状态，不处理中间弹窗
-            if (!vm.order_create_status) {
-                if (vm.showErrorPage && !vm.isRequestLimit) {
-                    return { status: 'error', msg: '未知错误' };
+            // 每次提交前重置弹窗标志，伪造点击触发 createOrder
+            bypassPopups(vm);
+            const event = makeClickEvent();
+
+            // 不 await createOrder：bilibili 内部 createOrder 的 Promise 可能不 resolve，
+            // await 会让 while 卡死、后续点击发不出去。改为 fire-and-forget。
+            try {
+                const r = vm.createOrder(0, event);
+                if (r && typeof r.then === 'function') {
+                    r.catch(e => console.warn('[purc] createOrder reject:', e.message));
                 }
+            } catch (e) {
+                console.warn('[purc] createOrder 异常:', e.message);
             }
+
+            window._purcAttempt++;
+            console.log(`[purc] 已提交 ${window._purcAttempt} 次 (errno 由 Python 监听判定)`);
+
+            await sleep(clickDelay);
         }
 
-        return { status: 'timeout' };
+        return { status: 'stopped' };
     };
+
+    // Python 终止重试循环的外部接口
+    window.stopPurc = function() { window._purcStop = true; };
 
     window.getOrderVm = () => window._orderVm;
 
-    console.log('[purc] 已加载，调用: submitOrder({buyerInfo, contact})');
+    console.log('[purc] 已加载，调用: submitOrder({buyerInfo, contact, clickDelay})');
 })();

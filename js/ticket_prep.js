@@ -5,6 +5,17 @@
 (function() {
     'use strict';
 
+    // 幂等守卫：同一页面重复注入时仅初始化一次，避免后台任务堆积
+    if (window.__prepLoaded__) {
+        console.log('[prep] 已加载过，跳过重复初始化');
+        // 复用已有闭包变量已不可能，但再次触发一次 VM 扫描以适配页面变化
+        if (typeof window.reacquireVm === 'function') {
+            window.reacquireVm(50).catch(() => {});
+        }
+        return;
+    }
+    window.__prepLoaded__ = true;
+
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     // ========== VM 管理 ==========
