@@ -16,6 +16,7 @@ const els = {
   btnFetchBuyers: document.getElementById('btnFetchBuyers'),
   buyerList: document.getElementById('buyerList'),
   buyerInfoManual: document.getElementById('buyerInfoManual'),
+  btnParseBuyerJson: document.getElementById('btnParseBuyerJson'),
   realNameHint: document.getElementById('realNameHint'),
 
   contactSection: document.getElementById('contactSection'),
@@ -236,6 +237,7 @@ function renderBuyerList(buyers) {
       } else {
         selectedBuyerIds = selectedBuyerIds.filter(id => id !== buyer.id);
       }
+      saveFormState();
     });
 
     const label = document.createElement('label');
@@ -248,10 +250,58 @@ function renderBuyerList(buyers) {
   }
 }
 
+function restoreBuyerCheckboxes() {
+  if (!selectedBuyerIds || selectedBuyerIds.length === 0) return;
+  for (const id of selectedBuyerIds) {
+    const cb = document.getElementById(`buyer_${id}`);
+    if (cb) cb.checked = true;
+  }
+}
+
 function maskIdCard(idCard) {
   if (!idCard || idCard.length < 8) return idCard;
   return idCard.slice(0, 3) + '****' + idCard.slice(-4);
 }
+
+// ========== 解析手动输入的JSON ==========
+els.btnParseBuyerJson.addEventListener('click', () => {
+  const manualText = els.buyerInfoManual.value.trim();
+  if (!manualText) {
+    log('请先输入JSON内容', 'error');
+    return;
+  }
+
+  try {
+    const parsed = JSON.parse(manualText);
+    if (!Array.isArray(parsed) || parsed.length === 0) {
+      log('JSON格式错误：需要非空数组', 'error');
+      return;
+    }
+
+    // 校验每个元素必须有name字段
+    for (const item of parsed) {
+      if (!item.name) {
+        log('JSON格式错误：每个对象必须包含name字段', 'error');
+        return;
+      }
+    }
+
+    // 给手动解析的buyer分配临时负数id，与API获取的区分开
+    const manualBuyers = parsed.map((item, idx) => ({
+      id: -(idx + 1),
+      name: item.name,
+      personal_id: item.idCard || item.personal_id || '',
+      tel: item.phone || item.tel || '',
+      _manual: true
+    }));
+
+    buyerData = manualBuyers;
+    renderBuyerList(manualBuyers);
+    log(`JSON解析成功，已加载 ${manualBuyers.length} 位实名人`, 'success');
+  } catch (e) {
+    log(`JSON解析失败: ${e.message}`, 'error');
+  }
+});
 
 // ========== 定时设置 ==========
 els.useTimer.addEventListener('change', () => {
@@ -444,6 +494,120 @@ async function pollState() {
 // 每2秒轮询一次状态
 setInterval(pollState, 2000);
 
+// ========== 状态持久化 ==========
+async function saveFormState() {
+  try {
+    const formData = {
+      projectId: els.projectId.value,
+      qty: els.qty.value,
+      buyerInfoManual: els.buyerInfoManual.value,
+      contactName: els.contactName.value,
+      contactPhone: els.contactPhone.value,
+      useTimer: els.useTimer.checked,
+      targetTime: els.targetTime.value,
+      advanceSeconds: els.advanceSeconds.value,
+      prepDelay: els.prepDelay.value,
+      purcDelay: els.purcDelay.value,
+      selectedBuyerIds: selectedBuyerIds,
+      timestamp: Date.now()
+    };
+    await chrome.storage.local.set({ popupFormData: formData });
+  } catch (e) {
+    console.warn('[Popup] 保存表单状态失败:', e);
+  }
+}
+
+async function restoreFormState() {
+  try {
+    const result = await chrome.storage.local.get('popupFormData');
+    const formData = result.popupFormData;
+    
+    if (!formData) {
+      log('无历史表单数据');
+      return false;
+    }
+    
+    // 检查数据是否过期（超过1小时）
+    if (Date.now() - formData.timestamp > 3600000) {
+      log('历史表单数据已过期，已清除');
+      await chrome.storage.local.remove('popupFormData');
+      return false;
+    }
+    
+    // 恢复表单字段
+    if (formData.projectId) els.projectId.value = formData.projectId;
+    if (formData.qty) els.qty.value = formData.qty;
+    if (formData.buyerInfoManual) els.buyerInfoManual.value = formData.buyerInfoManual;
+    if (formData.contactName) els.contactName.value = formData.contactName;
+    if (formData.contactPhone) els.contactPhone.value = formData.contactPhone;
+    if (formData.useTimer) {
+      els.useTimer.checked = formData.useTimer;
+      els.timerGroup.style.display = formData.useTimer ? 'block' : 'none';
+    }
+    if (formData.targetTime) els.targetTime.value = formData.targetTime;
+    if (formData.advanceSeconds) els.advanceSeconds.value = formData.advanceSeconds;
+    if (formData.prepDelay) els.prepDelay.value = formData.prepDelay;
+    if (formData.purcDelay) els.purcDelay.value = formData.purcDelay;
+    if (formData.selectedBuyerIds) selectedBuyerIds = formData.selectedBuyerIds;
+    
+    // 如果有保存的buyer数据，渲染列表
+    if (formData.buyerData && formData.buyerData.length > 0) {
+      buyerData = formData.buyerData;
+      renderBuyerList(buyerData);
+      restoreBuyerCheckboxes();
+    }
+    
+    log('已恢复历史表单数据', 'success');
+    return true;
+  } catch (e) {
+    console.warn('[Popup] 恢复表单状态失败:', e);
+    return false;
+  }
+}
+
+// 监听表单变化，自动保存
+function setupAutoSave() {
+  const saveFields = [
+    els.projectId, els.qty, els.buyerInfoManual,
+    els.contactName, els.contactPhone, els.targetTime,
+    els.advanceSeconds, els.prepDelay, els.purcDelay
+  ];
+  
+  saveFields.forEach(field => {
+    if (field) {
+      field.addEventListener('change', saveFormState);
+      field.addEventListener('input', debounceSave);
+    }
+  });
+  
+  els.useTimer.addEventListener('change', saveFormState);
+}
+
+let saveTimer = null;
+function debounceSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveFormState, 500);
+}
+
 // ========== 初始化 ==========
-log('MyGO Reloaded 已加载');
-updateButtons();
+async function init() {
+  log('MyGO Reloaded 已加载');
+  
+  // 恢复表单状态
+  await restoreFormState();
+  
+  // 设置自动保存
+  setupAutoSave();
+  
+  // 检查后台运行状态
+  const state = await sendMessage('getState');
+  if (state?.isRunning) {
+    isRunning = true;
+    updateStatus('running', '抢票中...');
+    log('检测到后台任务正在运行', 'warn');
+  }
+  
+  updateButtons();
+}
+
+init();
