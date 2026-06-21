@@ -435,11 +435,10 @@ async function runPurc(tabId, config) {
     }
 
     // running - 继续等待
+    const attemptCount = statusResult.attempt || 0;
+    globalState.attemptCount = attemptCount;
     if (checkCount % 20 === 0) {
-      const attemptCount = statusResult.attempt || 0;
       console.log(`[BG] 已等待 ${checkCount * 0.5} 秒，页面已尝试 ${attemptCount} 次`);
-      // 更新全局状态，让popup可以显示
-      globalState.attemptCount = attemptCount;
     }
   }
 

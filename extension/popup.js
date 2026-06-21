@@ -403,7 +403,7 @@ function updateButtons() {
 }
 
 // 上次记录的尝试次数
-let lastAttemptCount = 0;
+let lastLoggedAttemptCount = 0;
 
 // ========== 轮询状态 ==========
 async function pollState() {
@@ -420,12 +420,10 @@ async function pollState() {
         updateStatus('ready', '就绪');
       }
 
-      // 显示尝试次数（每20次输出一次）
-      if (state.attemptCount > 0 && state.attemptCount !== lastAttemptCount) {
-        if (state.attemptCount % 20 === 0) {
-          log(`已尝试 ${state.attemptCount} 次`, 'info');
-        }
-        lastAttemptCount = state.attemptCount;
+      // 显示尝试次数（每20次输出一次到日志）
+      if (state.attemptCount > 0 && state.attemptCount >= lastLoggedAttemptCount + 20) {
+        log(`已尝试下单 ${state.attemptCount} 次`, 'info');
+        lastLoggedAttemptCount = state.attemptCount;
       }
 
       if (state.orderId) {
