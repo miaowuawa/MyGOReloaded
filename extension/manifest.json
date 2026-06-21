@@ -1,0 +1,80 @@
+{
+  "manifest_version": 3,
+  "name": "MyGO Reloaded - B站会员购抢票助手",
+  "version": "1.0.0",
+  "description": "B站会员购自动抢票插件，支持定时抢票、自动获取实名人",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "declarativeNetRequest",
+    "webRequest",
+    "alarms",
+    "notifications"
+  ],
+  "host_permissions": [
+    "https://mall.bilibili.com/*",
+    "https://show.bilibili.com/*",
+    "https://pay.bilibili.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://mall.bilibili.com/neul-next/ticket-renovation/detail.html*"
+      ],
+      "js": [
+        "js/ticket_prep.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://mall.bilibili.com/neul-next/ticket/confirmOrder.html*"
+      ],
+      "js": [
+        "js/ticket_purc.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://mall.bilibili.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start",
+      "world": "ISOLATED"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "js/*.js",
+        "injected.js"
+      ],
+      "matches": [
+        "https://mall.bilibili.com/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

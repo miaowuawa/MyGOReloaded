@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MyGO Reloaded - 抢票助手</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>MyGO Reloaded</h1>
+      <p class="subtitle">B站会员购抢票助手</p>
+      <div class="status-bar" id="statusBar">
+        <span class="status-dot" id="statusDot"></span>
+        <span class="status-text" id="statusText">就绪</span>
+      </div>
+    </header>
+
+    <!-- 项目信息 -->
+    <section class="section">
+      <h2>项目信息</h2>
+      <div class="form-group">
+        <label for="projectId">项目ID</label>
+        <input type="text" id="projectId" placeholder="如: 1002171">
+        <button class="btn-secondary" id="btnFetchInfo">获取票务信息</button>
+      </div>
+
+      <div id="ticketInfo" class="ticket-info hidden">
+        <h3 id="projectName">--</h3>
+        <div class="form-group">
+          <label for="screenSelect">场次</label>
+          <select id="screenSelect"></select>
+        </div>
+        <div class="form-group">
+          <label for="ticketSelect">票种</label>
+          <select id="ticketSelect"></select>
+        </div>
+        <div class="info-row">
+          <span>价格: <strong id="ticketPrice">--</strong></span>
+          <span>限购: <strong id="ticketLimit">--</strong>张</span>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label for="qty">购买张数</label>
+        <input type="number" id="qty" value="1" min="1" max="6">
+      </div>
+    </section>
+
+    <!-- 实名人信息 -->
+    <section class="section">
+      <h2>实名人信息</h2>
+      <div class="hint" id="realNameHint">请先获取票务信息，判断是否需要实名制</div>
+      <button class="btn-secondary" id="btnFetchBuyers">获取实名人列表</button>
+      <div id="buyerList" class="buyer-list"></div>
+      <div class="form-group">
+        <label>或手动输入购买人信息（JSON格式）</label>
+        <textarea id="buyerInfoManual" rows="3" placeholder='[{"name":"张三","idCard":"123456","phone":"13800138000"}]'></textarea>
+      </div>
+    </section>
+
+    <!-- 联系人信息 -->
+    <section class="section" id="contactSection">
+      <h2>联系人信息 <span class="badge" id="contactBadge">必填</span></h2>
+      <div class="hint" id="contactHint">该票种需要填写联系人信息</div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="contactName">姓名</label>
+          <input type="text" id="contactName" placeholder="张三">
+        </div>
+        <div class="form-group">
+          <label for="contactPhone">手机号</label>
+          <input type="text" id="contactPhone" placeholder="13800138000">
+        </div>
+      </div>
+    </section>
+
+    <!-- 定时设置 -->
+    <section class="section">
+      <h2>定时设置</h2>
+      <div class="form-group checkbox-group">
+        <input type="checkbox" id="useTimer">
+        <label for="useTimer">启用定时抢票</label>
+      </div>
+      <div class="form-group" id="timerGroup">
+        <label for="targetTime">抢票时间</label>
+        <input type="datetime-local" id="targetTime">
+        <label for="advanceSeconds" style="margin-top: 8px;">提前prepare秒数</label>
+        <input type="number" id="advanceSeconds" value="0.4" step="0.1" min="0" max="5">
+      </div>
+    </section>
+
+    <!-- 高级设置 -->
+    <section class="section">
+      <h2>高级设置</h2>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="prepDelay">Prep延迟(ms)</label>
+          <input type="number" id="prepDelay" value="200" min="50" max="5000">
+        </div>
+        <div class="form-group">
+          <label for="purcDelay">下单延迟(ms) <span class="hint-inline">最小600</span></label>
+          <input type="number" id="purcDelay" value="600" min="600" max="5000">
+        </div>
+      </div>
+    </section>
+
+    <!-- 操作按钮 -->
+    <section class="section actions">
+      <button class="btn-primary" id="btnStart">开始抢票</button>
+      <button class="btn-danger" id="btnStop" disabled>停止抢票</button>
+    </section>
+
+    <!-- 日志 -->
+    <section class="section">
+      <h2>运行日志</h2>
+      <div class="log-container" id="logContainer"></div>
+    </section>
+  </div>
+
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

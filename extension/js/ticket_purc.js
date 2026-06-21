@@ -1,17 +1,28 @@
 // ===== B站确认订单页 - 纯请求工具 (purc) =====
 // 职责：在浏览器环境内执行 createOrder，返回原始响应
-// 不处理重试、不弹窗、不跳转，Python 通过监听数据包获取结果
+// 不处理重试、不弹窗、不跳转，由 background 通过消息通信获取结果
 
 (function() {
     'use strict';
+
+    // 幂等守卫
+    if (window.__purcLoaded__) {
+        console.log('[purc] 已加载过，跳过重复初始化');
+        return;
+    }
+    window.__purcLoaded__ = true;
 
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
     // ========== 全局计数器 ==========
     let attemptCount = 0;
+    let purcLoopRunning = false;
 
     // ========== 顶部状态栏 ==========
     (function injectStatusBar() {
+        const existing = document.getElementById('__purcStatusBar__');
+        if (existing) return;
+
         const bar = document.createElement('div');
         bar.id = '__purcStatusBar__';
         bar.style.cssText = `
@@ -221,7 +232,100 @@
         console.log('[purc] 已重置弹窗 + 提交状态');
     }
 
-    // ========== 主入口 ==========
+    // ========== 错误码处理 ==========
+    const PURC_STOP_CODES = new Set([100048, 100079]);
+    const PURC_END_CODES = new Set([100005, 100004, 212, 100039, 100016]);
+
+    function handleCreateOrderResponse(response) {
+        if (!response || typeof response !== 'object') return;
+
+        const errno = response.errno;
+        if (errno === undefined) return;
+
+        console.log('[purc] createOrder响应 errno:', errno);
+
+        if (PURC_STOP_CODES.has(errno)) {
+            console.log('[purc] 抢票成功！停止循环');
+            window._purcStop = true;
+            window._purcFinalStatus = { status: 'stop', errno: errno, msg: response.msg || '抢票成功' };
+            return;
+        }
+
+        if (PURC_END_CODES.has(errno)) {
+            console.log('[purc] 活动结束，停止循环');
+            window._purcStop = true;
+            window._purcFinalStatus = { status: 'end', errno: errno, msg: response.msg || '活动结束' };
+            return;
+        }
+    }
+
+    // ========== 后台下单循环（非阻塞） ==========
+    async function startPurcLoop(vm, clickDelay) {
+        if (purcLoopRunning) {
+            console.log('[purc] 下单循环已在运行');
+            return;
+        }
+        purcLoopRunning = true;
+        window._purcStop = false;
+        window._purcAttempt = 0;
+        window._purcFinalStatus = null;
+        console.log(`[purc] 启动后台下单循环 (clickDelay=${clickDelay}ms)`);
+
+        // 监听页面跳转，自动停止循环
+        let lastUrl = window.location.href;
+        const urlObserver = setInterval(() => {
+            if (window.location.href !== lastUrl) {
+                console.log('[purc] 检测到页面跳转，自动停止下单循环');
+                lastUrl = window.location.href;
+                window._purcStop = true;
+                clearInterval(urlObserver);
+            }
+        }, 500);
+
+        while (!window._purcStop) {
+            if (vm.orderId) {
+                console.log('[purc] 抢到订单！orderId:', vm.orderId);
+                clearInterval(urlObserver);
+                purcLoopRunning = false;
+                return;
+            }
+            window.ticketHasStock = true;
+            window.ticketUnpaidOrderId = null;
+            window.ticketStockStatus = 3;
+
+            bypassPopups(vm);
+            const event = makeClickEvent();
+
+            try {
+                const r = vm.createOrder(0, event);
+                if (r && typeof r.then === 'function') {
+                    r.then(res => {
+                        handleCreateOrderResponse(res);
+                    }).catch(e => {
+                        console.warn('[purc] createOrder reject:', e.message);
+                    });
+                }
+            } catch (e) {
+                console.warn('[purc] createOrder 异常:', e.message);
+            }
+
+            window._purcAttempt++;
+            attemptCount++;
+            updateStatus();
+
+            if (window._purcAttempt % 10 === 0) {
+                console.log(`[purc] 已提交 ${window._purcAttempt} 次`);
+            }
+
+            await sleep(clickDelay);
+        }
+
+        clearInterval(urlObserver);
+        purcLoopRunning = false;
+        console.log('[purc] 下单循环已停止');
+    }
+
+    // ========== 主入口（立即返回，启动后台循环） ==========
     window.submitOrder = async function(options = {}) {
         const vm = await getVm();
         if (!vm) {
@@ -247,44 +351,52 @@
         }
 
         const clickDelay = (options.clickDelay && options.clickDelay > 0) ? options.clickDelay : 250;
-        window._purcStop = false;
-        window._purcAttempt = 0;
-        console.log(`[purc] 进入重试循环 (clickDelay=${clickDelay}ms)，由数据包监听决定终止`);
 
-        while (!window._purcStop) {
-            if (vm.orderId) {
-                return { status: 'success', orderId: vm.orderId };
-            }
-            window.ticketHasStock = true;
-            window.ticketUnpaidOrderId = null;
-            window.ticketStockStatus = 3;
+        // 启动后台循环（不阻塞）
+        startPurcLoop(vm, clickDelay);
 
-            bypassPopups(vm);
-            const event = makeClickEvent();
-
-            try {
-                const r = vm.createOrder(0, event);
-                if (r && typeof r.then === 'function') {
-                    r.catch(e => console.warn('[purc] createOrder reject:', e.message));
-                }
-            } catch (e) {
-                console.warn('[purc] createOrder 异常:', e.message);
-            }
-
-            window._purcAttempt++;
-            attemptCount++;          // 每次提交都计数
-            updateStatus();          // 更新顶部显示
-            console.log(`[purc] 已提交 ${window._purcAttempt} 次 (errno 由 Python 监听判定)`);
-
-            await sleep(clickDelay);
-        }
-
-        return { status: 'stopped' };
+        // 立即返回，让调用方知道循环已启动
+        return { status: 'started', msg: '下单循环已启动' };
     };
 
-    window.stopPurc = function() { window._purcStop = true; };
+    // ========== 检查订单状态 ==========
+    window.checkOrderStatus = function() {
+        // 先检查是否有最终状态（活动结束/抢票成功等）
+        if (window._purcFinalStatus) {
+            return window._purcFinalStatus;
+        }
 
-    window.getOrderVm = () => window._orderVm;
+        // 先检查当前是否还在确认订单页
+        const currentVm = findVueInstance();
+        if (!currentVm) {
+            // 页面已跳转，可能token过期返回了信息页
+            console.log('[purc] 当前不在确认订单页，可能token过期');
+            return { status: 'expired', msg: 'token过期或页面已跳转' };
+        }
+
+        const vm = window._orderVm;
+        if (vm && vm.orderId) {
+            return { status: 'success', orderId: vm.orderId };
+        }
+        if (!purcLoopRunning && !window._purcStop) {
+            return { status: 'stopped', msg: '循环异常停止' };
+        }
+        return { status: 'running', attempt: window._purcAttempt || 0 };
+    };
+
+    window.stopPurc = function() {
+        window._purcStop = true;
+        purcLoopRunning = false;
+    };
+
+    window.getOrderVm = function() {
+        // 每次获取前重新扫描，避免返回旧页面实例
+        const vm = findVueInstance();
+        if (vm) {
+            window._orderVm = vm;
+        }
+        return window._orderVm;
+    };
 
     console.log('[purc] 已加载，调用: submitOrder({buyerInfo, contact, clickDelay})');
 })();
