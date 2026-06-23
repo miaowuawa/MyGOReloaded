@@ -18,9 +18,7 @@ Using them may cause your account being banned or being limited.
 This Project provides a new train of thought for tool developers to bypass any kinds of risk-control system.
 
 ## How does it work?
-This project is powered by **DrissionPage**. It is an advanced package (better than selenium) to automatically control the browser. 
-
-Drissionpage features datapackage listening in your browser.
+This project is powered by **Chrome Web Extension**
 
 With JS directly calling order creating functions in frontend, any modify on risk-control system will be easily bypassed because it is hard to identify whether user or script triggered the order_create event.
 
@@ -30,4 +28,3 @@ Yes,but not now, at least after 1 year. We all know that risk-control engineers 
 
 The principle of the script make it hard to be banned. It makes few fake params but use the genuine params instead^_^
 
-## 
