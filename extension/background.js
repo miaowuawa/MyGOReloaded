@@ -9,11 +9,30 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let globalState = {
   isRunning: false,
   config: null,
-  currentPhase: 'idle', // idle | prep | purc
+  currentPhase: 'idle', // idle | prep | purc | stock_check
   lastError: null,
   orderId: null,
-  attemptCount: 0
+  attemptCount: 0,
+  stockCheckCount: 0,
+  mode: 'presale', // presale | resale
+  logs: [], // 日志队列，用于popup同步显示
+  startTime: null
 };
+
+// ========== 日志管理（修复popup日志显示问题） ==========
+function addLog(msg, type = 'info') {
+  const entry = { time: Date.now(), msg, type };
+  globalState.logs.push(entry);
+  // 只保留最近200条日志
+  if (globalState.logs.length > 200) {
+    globalState.logs = globalState.logs.slice(-200);
+  }
+  console.log(`[BG][${type}] ${msg}`);
+}
+
+function clearLogs() {
+  globalState.logs = [];
+}
 
 // ========== 存储管理 ==========
 async function getStorage(key) {
@@ -204,32 +223,53 @@ function parseTicketInfo(data) {
   return result;
 }
 
-// ========== 网络请求监听（用于捕获prep和purc响应） ==========
-let requestListeners = new Map();
+// ========== 库存检测（回流模式核心） ==========
+// stockStatus: 1=TEMP_SOLD_OUT, 2=SOLD_OUT, 3=HAS_STOCK
+const STOCK_STATUS = {
+  TEMP_SOLD_OUT: 1,
+  SOLD_OUT: 2,
+  HAS_STOCK: 3
+};
 
-function setupRequestListener(tabId, urlPattern, timeout = 10000) {
-  return new Promise((resolve) => {
-    const listener = (details) => {
-      if (details.tabId === tabId && details.url.includes(urlPattern)) {
-        chrome.webRequest.onCompleted.removeListener(listener);
-        requestListeners.delete(tabId);
-        resolve(details);
-      }
-    };
+async function checkStock(tabId, config) {
+  try {
+    const result = await executeScript(tabId, (pid, sid, tid) => {
+      return new Promise((resolve) => {
+        const url = 'https://show.bilibili.com/api/ticket/stock/check';
+        fetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'Referer': 'https://mall.bilibili.com/'
+          },
+          body: JSON.stringify({
+            projectId: pid,
+            skuId: tid,
+            screenId: sid
+          })
+        })
+        .then(r => r.text())
+        .then(text => {
+          try {
+            const data = JSON.parse(text);
+            resolve(data);
+          } catch (e) {
+            resolve({ errno: -1, msg: 'JSON解析失败', raw: text.substring(0, 200) });
+          }
+        })
+        .catch(e => {
+          resolve({ errno: -1, msg: e.message });
+        });
+      });
+    }, [config.project_id, config.screen_id, config.ticket_id]);
 
-    chrome.webRequest.onCompleted.addListener(
-      listener,
-      { urls: ['*://show.bilibili.com/api/ticket/order/*'] }
-    );
-
-    requestListeners.set(tabId, listener);
-
-    setTimeout(() => {
-      chrome.webRequest.onCompleted.removeListener(listener);
-      requestListeners.delete(tabId);
-      resolve(null);
-    }, timeout);
-  });
+    return result;
+  } catch (e) {
+    console.error('[BG] 库存检测失败:', e.message);
+    return { errno: -1, msg: e.message };
+  }
 }
 
 // ========== Prep 阶段 ==========
@@ -451,6 +491,461 @@ async function runPurc(tabId, config) {
   return { status: 'retry', msg: 'Purc轮询超时' };
 }
 
+// ========== 回流模式：库存检测循环 ==========
+async function runResaleMode(config) {
+  console.log('[BG] 开始回流模式');
+  addLog('进入回流模式，持续监测库存...', 'info');
+  globalState.mode = 'resale';
+  globalState.currentPhase = 'stock_check';
+
+  let tab = await getMallTab();
+  if (!tab) {
+    addLog('未找到会员购页面，创建新标签页', 'warn');
+    try {
+      tab = await chrome.tabs.create({
+        url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+        active: true
+      });
+      await sleep(3000);
+    } catch (e) {
+      addLog('创建标签页失败: ' + e.message, 'error');
+      globalState.isRunning = false;
+      notifyEnd('创建标签页失败');
+      return;
+    }
+  } else {
+    // 确保在详情页
+    try {
+      await chrome.tabs.update(tab.id, {
+        url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+        active: true
+      });
+      await sleep(3000);
+    } catch (e) {
+      addLog('导航到详情页失败: ' + e.message, 'error');
+    }
+  }
+
+  tab = await getMallTab();
+  if (!tab) {
+    addLog('无法获取标签页', 'error');
+    globalState.isRunning = false;
+    notifyEnd('无法获取标签页');
+    return;
+  }
+
+  const stockCheckDelay = config.stock_check_delay_ms || 500;
+  let stockCheckCount = 0;
+
+  // 回流模式主循环：持续检测库存 → 下单 → 失败则返回继续检测
+  while (globalState.isRunning) {
+    let hasStockFound = false;
+
+    // ===== 阶段1：库存检测循环 =====
+    while (globalState.isRunning && !hasStockFound) {
+      stockCheckCount++;
+      globalState.stockCheckCount = stockCheckCount;
+
+      const stockResult = await checkStock(tab.id, config);
+      console.log('[BG] 库存检测:', stockCheckCount, stockResult);
+
+      if (!stockResult) {
+        await sleep(stockCheckDelay);
+        continue;
+      }
+
+      if (stockResult.errno !== 0) {
+        addLog(`库存检测API错误: ${stockResult.msg || '未知错误'}`, 'error');
+        await sleep(stockCheckDelay);
+        continue;
+      }
+
+      const stockData = stockResult.data || {};
+      const hasStock = stockData.hasStock === true;
+      const stockStatus = stockData.stockStatus;
+      const unpaidOrderId = stockData.unpaidOrderId;
+
+      // 每2000次检测输出一次日志
+      if (stockCheckCount % 2000 === 0) {
+        const statusText = stockStatus === STOCK_STATUS.HAS_STOCK ? '有票' :
+                          stockStatus === STOCK_STATUS.SOLD_OUT ? '售罄' : '暂时售罄';
+        addLog(`已检测库存 ${stockCheckCount} 次，当前状态: ${statusText}`, 'info');
+      }
+
+      // 检测到有未支付订单
+      if (unpaidOrderId) {
+        addLog(`发现未支付订单: ${unpaidOrderId}`, 'success');
+        globalState.isRunning = false;
+        globalState.orderId = unpaidOrderId;
+        notifySuccess(`发现未支付订单: ${unpaidOrderId}`);
+        return;
+      }
+
+      // 检测到有库存
+      if (hasStock || stockStatus === STOCK_STATUS.HAS_STOCK) {
+        addLog('检测到库存！开始prepare下单...', 'success');
+        hasStockFound = true;
+        break;
+      }
+
+      // 彻底售罄也继续检测（回流模式核心：票可能再次放出）
+      if (stockStatus === STOCK_STATUS.SOLD_OUT) {
+        // 每2000次输出一次，避免日志刷屏
+        if (stockCheckCount % 2000 === 0) {
+          addLog('当前售罄，继续监测...', 'info');
+        }
+      }
+
+      // 暂时售罄，继续检测
+      await sleep(stockCheckDelay);
+    }
+
+    if (!globalState.isRunning) {
+      addLog('用户停止抢票', 'info');
+      return;
+    }
+
+    // ===== 阶段2：有库存了，进入prep-purc流程 =====
+    addLog('库存 detected，进入下单流程', 'info');
+    await runPrepPurcLoop(tab, config);
+
+    // runPrepPurcLoop 返回后，检查是否还在运行
+    if (!globalState.isRunning) {
+      addLog('抢票流程结束', 'info');
+      return;
+    }
+
+    // 如果还在运行，说明下单失败了，返回详情页继续检测库存
+    addLog('下单流程结束，返回库存检测...', 'info');
+
+    // 确保回到详情页
+    tab = await getMallTab();
+    if (tab) {
+      try {
+        await chrome.tabs.update(tab.id, {
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+          active: true
+        });
+        await sleep(2000);
+      } catch (e) {
+        console.warn('[BG] 返回详情页失败:', e.message);
+      }
+    } else {
+      // 标签页丢失，重新创建
+      try {
+        tab = await chrome.tabs.create({
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+          active: true
+        });
+        await sleep(3000);
+      } catch (e) {
+        addLog('重新创建标签页失败', 'error');
+        globalState.isRunning = false;
+        notifyEnd('标签页操作失败');
+        return;
+      }
+    }
+
+    tab = await getMallTab();
+    if (!tab) {
+      addLog('无法获取标签页，停止抢票', 'error');
+      globalState.isRunning = false;
+      notifyEnd('无法获取标签页');
+      return;
+    }
+
+    // 继续外层while循环，重新检测库存
+  }
+}
+
+// ========== Prep-Purc 循环（供预售和回流模式复用） ==========
+async function runPrepPurcLoop(tab, config) {
+  let prepUrl = null;
+  let purcCycles = 0;
+  const maxPurcCycles = 10;
+
+  // 先执行prep
+  let prepAttempts = 0;
+  const maxPrepAttempts = 200;
+
+  while (prepAttempts < maxPrepAttempts && globalState.isRunning) {
+    prepAttempts++;
+    globalState.attemptCount = prepAttempts;
+
+    if (prepAttempts % 20 === 0) {
+      addLog(`Prep尝试 ${prepAttempts} 次...`, 'info');
+    }
+
+    const result = await runPrep(tab.id, config);
+
+    if (result.status === 'success') {
+      prepUrl = result.url;
+      break;
+    } else if (result.status === 'stop') {
+      globalState.isRunning = false;
+      notifySuccess(result.msg);
+      return;
+    } else if (result.status === 'end') {
+      globalState.isRunning = false;
+      notifyEnd(result.msg);
+      return;
+    } else if (result.status === 'refresh') {
+      await sendToTab(tab.id, 'refreshStock', { projectId: config.project_id });
+      await sleep(config.prep_retry_delay_ms || 200);
+    } else if (result.status === 'restart') {
+      try {
+        await chrome.tabs.update(tab.id, {
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
+        });
+        await sleep(2000);
+      } catch (e) {
+        console.warn('[BG] 重新加载页面失败:', e.message);
+      }
+    } else {
+      await sleep(config.prep_retry_delay_ms || 200);
+    }
+  }
+
+  if (!prepUrl) {
+    addLog('Prep阶段超时，返回库存检测', 'warn');
+    return;
+  }
+
+  // Purc循环
+  while (purcCycles < maxPurcCycles && globalState.isRunning) {
+    purcCycles++;
+
+    // 检查标签页
+    tab = await getMallTab();
+    if (!tab) {
+      addLog('标签页已关闭，重新创建', 'warn');
+      try {
+        tab = await chrome.tabs.create({
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+          active: true
+        });
+        await sleep(3000);
+        tab = await getMallTab();
+      } catch (e) {
+        addLog('重新创建标签页失败', 'error');
+        globalState.isRunning = false;
+        notifyEnd('标签页操作失败');
+        return;
+      }
+      prepUrl = null;
+      break;
+    }
+
+    // 跳转确认订单页
+    try {
+      await chrome.tabs.update(tab.id, { url: prepUrl });
+    } catch (e) {
+      console.warn('[BG] 跳转确认订单页失败:', e.message);
+    }
+    await sleep(2000);
+
+    tab = await getMallTab();
+    if (!tab) {
+      addLog('标签页丢失，重新创建', 'warn');
+      try {
+        tab = await chrome.tabs.create({
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+          active: true
+        });
+        await sleep(3000);
+        tab = await getMallTab();
+      } catch (e) {
+        globalState.isRunning = false;
+        notifyEnd('标签页操作失败');
+        return;
+      }
+      prepUrl = null;
+      break;
+    }
+
+    // Purc阶段
+    const result = await runPurc(tab.id, config);
+    addLog(`Purc结果: ${result.status}`, 'info');
+
+    if (result.status === 'success') {
+      globalState.isRunning = false;
+      globalState.orderId = result.orderId;
+      notifySuccess(`抢票成功！订单号: ${result.orderId}`);
+      return;
+    } else if (result.status === 'stop') {
+      globalState.isRunning = false;
+      notifySuccess(result.msg);
+      return;
+    } else if (result.status === 'end') {
+      globalState.isRunning = false;
+      notifyEnd(result.msg);
+      return;
+    } else if (result.status === 'stopped') {
+      globalState.isRunning = false;
+      notifyEnd(result.msg || '已停止抢票');
+      return;
+    } else if (result.status === 'expired') {
+      await sendToTab(tab.id, 'resetPopupState');
+      // 重新prep
+      let newPrepAttempts = 0;
+      prepUrl = null;
+      while (newPrepAttempts < 100 && globalState.isRunning) {
+        newPrepAttempts++;
+        const prepResult = await runPrep(tab.id, config);
+        if (prepResult.status === 'success') {
+          prepUrl = prepResult.url;
+          break;
+        } else if (prepResult.status === 'stop' || prepResult.status === 'end') {
+          globalState.isRunning = false;
+          if (prepResult.status === 'stop') notifySuccess(prepResult.msg);
+          else notifyEnd(prepResult.msg);
+          return;
+        }
+        await sleep(config.prep_retry_delay_ms || 200);
+      }
+      if (!prepUrl) {
+        addLog('重新Prep失败，返回库存检测', 'warn');
+        return;
+      }
+      continue;
+    } else if (result.status === 'retry') {
+      if (!globalState.isRunning) {
+        notifyEnd('已停止抢票');
+        return;
+      }
+      // 返回detail页重新prep
+      try {
+        await chrome.tabs.update(tab.id, {
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
+        });
+        await sleep(2000);
+      } catch (e) {
+        console.warn('[BG] 跳转detail页失败:', e.message);
+      }
+
+      let newPrepAttempts = 0;
+      prepUrl = null;
+      while (newPrepAttempts < 100 && globalState.isRunning) {
+        newPrepAttempts++;
+        tab = await getMallTab();
+        if (!tab) {
+          globalState.isRunning = false;
+          notifyEnd('标签页已关闭');
+          return;
+        }
+        const prepResult = await runPrep(tab.id, config);
+        if (prepResult.status === 'success') {
+          prepUrl = prepResult.url;
+          break;
+        } else if (prepResult.status === 'stop' || prepResult.status === 'end') {
+          globalState.isRunning = false;
+          if (prepResult.status === 'stop') notifySuccess(prepResult.msg);
+          else notifyEnd(prepResult.msg);
+          return;
+        }
+        await sleep(config.prep_retry_delay_ms || 200);
+      }
+
+      if (!globalState.isRunning) {
+        notifyEnd('已停止抢票');
+        return;
+      }
+      if (!prepUrl) {
+        addLog('重新Prep失败，返回库存检测', 'warn');
+        return;
+      }
+      continue;
+    } else {
+      globalState.isRunning = false;
+      notifyEnd('Purc阶段结束: ' + result.msg);
+      return;
+    }
+  }
+
+  if (purcCycles >= maxPurcCycles) {
+    addLog('Purc循环次数超限，返回库存检测', 'warn');
+  }
+}
+
+// ========== 预售模式主流程 ==========
+async function runPresaleMode(config) {
+  console.log('[BG] 开始预售模式');
+  addLog('进入预售模式', 'info');
+  globalState.mode = 'presale';
+
+  let tab = await getMallTab();
+  if (!tab) {
+    addLog('未找到会员购页面，创建新标签页', 'warn');
+    try {
+      tab = await chrome.tabs.create({
+        url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+        active: true
+      });
+      await sleep(3000);
+    } catch (e) {
+      addLog('创建标签页失败: ' + e.message, 'error');
+      globalState.isRunning = false;
+      notifyEnd('创建标签页失败');
+      return;
+    }
+  } else {
+    try {
+      await chrome.tabs.update(tab.id, {
+        url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+        active: true
+      });
+      await sleep(3000);
+    } catch (e) {
+      addLog('导航到详情页失败: ' + e.message, 'error');
+    }
+  }
+
+  tab = await getMallTab();
+  if (!tab) {
+    addLog('无法获取标签页', 'error');
+    globalState.isRunning = false;
+    notifyEnd('无法获取标签页');
+    return;
+  }
+
+  // 预售模式直接进入prep-purc循环
+  await runPrepPurcLoop(tab, config);
+
+  // 如果还在运行（prep-purc因为某些原因退出了但没有结束），继续循环
+  while (globalState.isRunning) {
+    // 检查是否超过30分钟
+    const elapsed = Date.now() - globalState.startTime;
+    if (elapsed > 30 * 60 * 1000) {
+      addLog('预售模式已运行30分钟，自动切换至回流模式', 'warn');
+      await runResaleMode(config);
+      return;
+    }
+
+    addLog('预售模式继续尝试...', 'info');
+    await sleep(1000);
+
+    // 重新获取tab并继续
+    tab = await getMallTab();
+    if (!tab) {
+      try {
+        tab = await chrome.tabs.create({
+          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
+          active: true
+        });
+        await sleep(3000);
+        tab = await getMallTab();
+      } catch (e) {
+        addLog('重新创建标签页失败', 'error');
+        globalState.isRunning = false;
+        notifyEnd('标签页操作失败');
+        return;
+      }
+    }
+
+    await runPrepPurcLoop(tab, config);
+  }
+}
+
 // ========== 主抢票流程 ==========
 async function startTicketProcess(config) {
   if (globalState.isRunning) {
@@ -464,376 +959,35 @@ async function startTicketProcess(config) {
   globalState.lastError = null;
   globalState.orderId = null;
   globalState.attemptCount = 0;
+  globalState.stockCheckCount = 0;
+  globalState.startTime = Date.now();
+  clearLogs();
 
-  console.log('[BG] 开始抢票流程', config);
+  const mode = config.grab_mode || 'presale';
+  addLog(`开始抢票流程 [模式: ${mode === 'presale' ? '预售' : '回流'}]`, 'info');
 
   try {
-    // 1. 打开或获取详情页标签页
-    let tab = await getMallTab();
-    if (!tab) {
-      console.log('[BG] 创建新标签页');
-      try {
-        tab = await chrome.tabs.create({
-          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
-          active: true
-        });
-      } catch (e) {
-        console.error('[BG] 创建标签页失败:', e.message);
-        globalState.isRunning = false;
-        notifyEnd('创建标签页失败: ' + e.message);
-        return;
-      }
-      await sleep(3000); // 等待页面加载
+    if (mode === 'resale') {
+      await runResaleMode(config);
     } else {
-      // 导航到详情页
-      try {
-        await chrome.tabs.update(tab.id, {
-          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
-          active: true
-        });
-      } catch (e) {
-        console.error('[BG] 导航到详情页失败:', e.message);
-        globalState.isRunning = false;
-        notifyEnd('导航失败: ' + e.message);
-        return;
-      }
-      await sleep(3000);
+      await runPresaleMode(config);
     }
-
-    // 重新获取tab
-    tab = await getMallTab();
-    if (!tab) {
-      console.error('[BG] 无法获取mall.bilibili.com标签页');
-      globalState.isRunning = false;
-      notifyEnd('无法获取标签页');
-      return;
-    }
-
-    // 2. Prep阶段
-    let prepUrl = null;
-    let prepAttempts = 0;
-    const maxPrepAttempts = 500;
-
-    while (prepAttempts < maxPrepAttempts && globalState.isRunning) {
-      prepAttempts++;
-      globalState.attemptCount = prepAttempts;
-
-      // 每20次prep输出日志
-      if (prepAttempts % 20 === 0) {
-        console.log(`[BG] 已尝试Prep ${prepAttempts} 次`);
-      }
-
-      const result = await runPrep(tab.id, config);
-      console.log(`[BG] Prep尝试 ${prepAttempts}:`, result.status);
-
-      if (result.status === 'success') {
-        prepUrl = result.url;
-        break;
-      } else if (result.status === 'stop') {
-        globalState.isRunning = false;
-        notifySuccess(result.msg);
-        return;
-      } else if (result.status === 'end') {
-        globalState.isRunning = false;
-        notifyEnd(result.msg);
-        return;
-      } else if (result.status === 'refresh') {
-        // 刷新库存
-        await sendToTab(tab.id, 'refreshStock', { projectId: config.project_id });
-        await sleep(config.prep_retry_delay_ms || 200);
-      } else if (result.status === 'restart') {
-        // 重新加载页面
-        try {
-          await chrome.tabs.update(tab.id, {
-            url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
-          });
-          await sleep(2000);
-        } catch (e) {
-          console.warn('[BG] 重新加载页面失败:', e.message);
-          // 标签页可能已关闭，尝试重新获取
-          tab = await getMallTab();
-          if (!tab) {
-            console.log('[BG] 标签页已关闭，重新创建');
-            try {
-              tab = await chrome.tabs.create({
-                url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
-                active: true
-              });
-              await sleep(3000);
-            } catch (createErr) {
-              console.error('[BG] 创建标签页失败:', createErr.message);
-              globalState.isRunning = false;
-              notifyEnd('标签页操作失败');
-              return;
-            }
-            tab = await getMallTab();
-            if (!tab) {
-              globalState.isRunning = false;
-              notifyEnd('无法获取标签页');
-              return;
-            }
-          }
-        }
-      } else {
-        // retry
-        await sleep(config.prep_retry_delay_ms || 200);
-      }
-    }
-
-    if (!prepUrl) {
-      globalState.isRunning = false;
-      notifyEnd('Prep阶段超时');
-      return;
-    }
-
-    // 3-4. Prep-Purc循环（支持token过期后重新prep）
-    let purcCycles = 0;
-    const maxPurcCycles = 10; // 最多重新prep 10次
-
-    while (purcCycles < maxPurcCycles && globalState.isRunning) {
-      purcCycles++;
-
-      // 检查标签页是否还存在
-      tab = await getMallTab();
-      if (!tab) {
-        console.log('[BG] 标签页已关闭，重新创建');
-        tab = await chrome.tabs.create({
-          url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
-          active: true
-        });
-        await sleep(3000);
-        // 重新获取tab
-        tab = await getMallTab();
-        if (!tab) {
-          throw new Error('重新创建标签页失败');
-        }
-        // 标签页刚创建，需要重新prep
-        prepUrl = null;
-        break; // 跳出purc循环，进入重新prep
-      }
-
-      // 跳转到确认订单页
-      console.log(`[BG] 第${purcCycles}次跳转确认订单页:`, prepUrl);
-      try {
-        await chrome.tabs.update(tab.id, { url: prepUrl });
-      } catch (e) {
-        console.warn('[BG] 跳转确认订单页失败:', e.message);
-        // 标签页可能已关闭，尝试重新创建
-        tab = null;
-      }
-      await sleep(2000);
-
-      // 重新获取tab
-      if (!tab) {
-        tab = await getMallTab();
-      }
-      if (!tab) {
-        console.log('[BG] 标签页已关闭，重新创建');
-        try {
-          tab = await chrome.tabs.create({
-            url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`,
-            active: true
-          });
-          await sleep(3000);
-        } catch (e) {
-          console.error('[BG] 创建标签页失败:', e.message);
-          globalState.isRunning = false;
-          notifyEnd('标签页操作失败');
-          return;
-        }
-        // 重新获取tab
-        tab = await getMallTab();
-        if (!tab) {
-          globalState.isRunning = false;
-          notifyEnd('无法获取标签页');
-          return;
-        }
-        // 标签页刚创建，需要重新prep
-        prepUrl = null;
-        break; // 跳出purc循环，进入重新prep
-      }
-
-      // Purc阶段
-      const result = await runPurc(tab.id, config);
-      console.log('[BG] Purc最终结果:', result.status);
-
-      if (result.status === 'success') {
-        globalState.isRunning = false;
-        globalState.orderId = result.orderId;
-        notifySuccess(`抢票成功！订单号: ${result.orderId}`);
-        return;
-      } else if (result.status === 'stop') {
-        globalState.isRunning = false;
-        notifySuccess(result.msg);
-        return;
-      } else if (result.status === 'end') {
-        globalState.isRunning = false;
-        notifyEnd(result.msg);
-        return;
-      } else if (result.status === 'stopped') {
-        // 用户手动停止
-        globalState.isRunning = false;
-        notifyEnd(result.msg || '已停止抢票');
-        return;
-      } else if (result.status === 'expired') {
-        // token过期，需要重新prep
-        console.log('[BG] token过期，返回信息页重新prep');
-
-        // 停止当前purc循环
-        await sendToTab(tab.id, 'resetPopupState');
-
-        // 重新执行prep
-        let newPrepAttempts = 0;
-        const maxNewPrepAttempts = 100;
-        prepUrl = null;
-
-        while (newPrepAttempts < maxNewPrepAttempts && globalState.isRunning) {
-          newPrepAttempts++;
-
-          const prepResult = await runPrep(tab.id, config);
-          console.log(`[BG] 重新Prep尝试 ${newPrepAttempts}:`, prepResult.status);
-
-          if (prepResult.status === 'success') {
-            prepUrl = prepResult.url;
-            break;
-          } else if (prepResult.status === 'stop') {
-            globalState.isRunning = false;
-            notifySuccess(prepResult.msg);
-            return;
-          } else if (prepResult.status === 'end') {
-            globalState.isRunning = false;
-            notifyEnd(prepResult.msg);
-            return;
-          } else if (prepResult.status === 'refresh') {
-            await sendToTab(tab.id, 'refreshStock', { projectId: config.project_id });
-            await sleep(config.prep_retry_delay_ms || 200);
-          } else if (prepResult.status === 'restart') {
-            await chrome.tabs.update(tab.id, {
-              url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
-            });
-            await sleep(2000);
-          } else {
-            await sleep(config.prep_retry_delay_ms || 200);
-          }
-        }
-
-        if (!prepUrl) {
-          globalState.isRunning = false;
-          notifyEnd('重新Prep阶段超时');
-          return;
-        }
-
-        // 继续外层循环，用新的prepUrl跳转
-        continue;
-      } else if (result.status === 'retry') {
-        // 超时或其他可重试错误，返回detail页重新prepare
-        // 先检查用户是否已手动停止
-        if (!globalState.isRunning) {
-          console.log('[BG] 用户已停止抢票，退出');
-          globalState.isRunning = false;
-          notifyEnd('已停止抢票');
-          return;
-        }
-
-        console.log('[BG] Purc超时/错误，返回detail页重新prepare');
-
-        // 检查标签页是否还存在
-        tab = await getMallTab();
-        if (tab) {
-          // 导航回detail页
-          try {
-            await chrome.tabs.update(tab.id, {
-              url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
-            });
-            await sleep(2000);
-          } catch (e) {
-            console.warn('[BG] 跳转detail页失败:', e.message);
-          }
-        }
-
-        // 重新执行prep
-        let newPrepAttempts = 0;
-        const maxNewPrepAttempts = 100;
-        prepUrl = null;
-
-        while (newPrepAttempts < maxNewPrepAttempts && globalState.isRunning) {
-          newPrepAttempts++;
-
-          // 检查标签页是否还存在
-          tab = await getMallTab();
-          if (!tab) {
-            console.log('[BG] 标签页已关闭，停止抢票');
-            globalState.isRunning = false;
-            notifyEnd('标签页已关闭');
-            return;
-          }
-
-          const prepResult = await runPrep(tab.id, config);
-          console.log(`[BG] 超时后重新Prep尝试 ${newPrepAttempts}:`, prepResult.status);
-
-          if (prepResult.status === 'success') {
-            prepUrl = prepResult.url;
-            break;
-          } else if (prepResult.status === 'stop') {
-            globalState.isRunning = false;
-            notifySuccess(prepResult.msg);
-            return;
-          } else if (prepResult.status === 'end') {
-            globalState.isRunning = false;
-            notifyEnd(prepResult.msg);
-            return;
-          } else if (prepResult.status === 'refresh') {
-            await sendToTab(tab.id, 'refreshStock', { projectId: config.project_id });
-            await sleep(config.prep_retry_delay_ms || 200);
-          } else if (prepResult.status === 'restart') {
-            try {
-              await chrome.tabs.update(tab.id, {
-                url: `https://mall.bilibili.com/neul-next/ticket-renovation/detail.html?id=${config.project_id}&noTitleBar=1`
-              });
-              await sleep(2000);
-            } catch (e) {
-              console.warn('[BG] 跳转detail页失败:', e.message);
-            }
-          } else {
-            await sleep(config.prep_retry_delay_ms || 200);
-          }
-        }
-
-        if (!globalState.isRunning) {
-          console.log('[BG] 用户已停止抢票，退出');
-          notifyEnd('已停止抢票');
-          return;
-        }
-
-        if (!prepUrl) {
-          globalState.isRunning = false;
-          notifyEnd('超时后重新Prep失败');
-          return;
-        }
-
-        // 继续外层循环，用新的prepUrl跳转
-        continue;
-      } else {
-        // 其他错误，结束抢票
-        globalState.isRunning = false;
-        notifyEnd('Purc阶段结束: ' + result.msg);
-        return;
-      }
-    }
-
-    globalState.isRunning = false;
-    notifyEnd('Purc循环次数超限');
-
   } catch (e) {
     console.error('[BG] 抢票流程异常:', e);
+    addLog(`抢票流程异常: ${e.message}`, 'error');
     globalState.isRunning = false;
     globalState.lastError = e.message;
     notifyEnd(`异常: ${e.message}`);
   }
+
+  globalState.isRunning = false;
+  globalState.currentPhase = 'idle';
+  addLog('抢票流程已结束', 'info');
 }
 
 async function stopTicketProcess() {
   console.log('[BG] 停止抢票');
+  addLog('正在停止抢票...', 'info');
   globalState.isRunning = false;
 
   // 尝试通知页面停止purc循环

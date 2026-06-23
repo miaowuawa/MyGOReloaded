@@ -311,3 +311,61 @@ body {
 .section.hidden {
   display: none;
 }
+
+.guide-content details {
+  margin-bottom: 8px;
+  border: 1px solid #eee;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.guide-content summary {
+  padding: 8px 12px;
+  background: #fafafa;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: #333;
+  user-select: none;
+}
+
+.guide-content summary:hover {
+  background: #f0f0f0;
+}
+
+.guide-text {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: #666;
+  line-height: 1.6;
+}
+
+.guide-text h4 {
+  font-size: 12px;
+  color: #333;
+  margin: 10px 0 6px 0;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #eee;
+}
+
+.guide-text h4:first-child {
+  margin-top: 0;
+}
+
+.guide-text ol {
+  padding-left: 18px;
+  margin: 4px 0;
+}
+
+.guide-text li {
+  margin-bottom: 3px;
+}
+
+.guide-text code {
+  background: #f0f0f0;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: "Consolas", "Monaco", monospace;
+  font-size: 11px;
+  color: #ff6b6b;
+}

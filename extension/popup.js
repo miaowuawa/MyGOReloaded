@@ -24,10 +24,14 @@ const els = {
   contactBadge: document.getElementById('contactBadge'),
   contactHint: document.getElementById('contactHint'),
 
+  grabMode: document.getElementById('grabMode'),
+  presaleGroup: document.getElementById('presaleGroup'),
+  resaleGroup: document.getElementById('resaleGroup'),
   useTimer: document.getElementById('useTimer'),
   timerGroup: document.getElementById('timerGroup'),
   targetTime: document.getElementById('targetTime'),
   advanceSeconds: document.getElementById('advanceSeconds'),
+  stockCheckDelay: document.getElementById('stockCheckDelay'),
 
   prepDelay: document.getElementById('prepDelay'),
   purcDelay: document.getElementById('purcDelay'),
@@ -164,13 +168,14 @@ function updateRealNameHint(ticket) {
   // anonymous_buy === 1: 匿名购买（不需要实名制，但需要联系人）
   // anonymous_buy !== 1: 实名制（需要实名人，不需要联系人）
   const isAnonymous = ticket.anonymous_buy === 1;
+  const qty = parseInt(els.qty.value) || 1;
 
   // 实名人信息提示
   if (isAnonymous) {
     els.realNameHint.textContent = '该票种为匿名购买，无需实名人信息';
     els.realNameHint.style.borderLeftColor = '#52c41a';
   } else {
-    els.realNameHint.textContent = '该票种需要实名制，请选择或填写实名人信息';
+    els.realNameHint.textContent = `该票种需要实名制，请选择或填写 ${qty} 位实名人信息（购买${qty}张票）`;
     els.realNameHint.style.borderLeftColor = '#ff6b6b';
   }
 
@@ -253,16 +258,49 @@ function maskIdCard(idCard) {
   return idCard.slice(0, 3) + '****' + idCard.slice(-4);
 }
 
+// ========== 模式切换 ==========
+els.grabMode.addEventListener('change', () => {
+  const mode = els.grabMode.value;
+  if (mode === 'presale') {
+    els.presaleGroup.classList.remove('hidden');
+    els.resaleGroup.classList.add('hidden');
+  } else {
+    els.presaleGroup.classList.add('hidden');
+    els.resaleGroup.classList.remove('hidden');
+  }
+});
+
 // ========== 定时设置 ==========
 els.useTimer.addEventListener('change', () => {
   els.timerGroup.style.display = els.useTimer.checked ? 'block' : 'none';
 });
 els.timerGroup.style.display = 'none';
 
+// 购买张数变化时更新提示
+els.qty.addEventListener('change', () => {
+  if (ticketData) {
+    const screenId = parseInt(els.screenSelect.value);
+    const ticketId = parseInt(els.ticketSelect.value);
+    const screen = ticketData.screens.find(s => s.screen_id === screenId);
+    if (screen) {
+      const ticket = screen.tickets.find(t => t.ticket_id === ticketId);
+      if (ticket) {
+        updateRealNameHint(ticket);
+      }
+    }
+  }
+});
+
 // ========== 开始抢票 ==========
 els.btnStart.addEventListener('click', async () => {
   const config = buildConfig();
   if (!config) return;
+
+  // 重置日志索引
+  lastLogIndex = 0;
+  lastOrderId = null;
+  lastError = null;
+  els.logContainer.innerHTML = '';
 
   log('开始抢票...');
   updateStatus('running', '抢票中...');
@@ -287,14 +325,14 @@ els.btnStart.addEventListener('click', async () => {
 
 // ========== 停止抢票 ==========
 els.btnStop.addEventListener('click', async () => {
-  log('停止抢票...');
+  log('正在发送停止指令...');
+  updateStatus('running', '停止中...');
 
   try {
     await sendMessage('stopTicket');
-    isRunning = false;
-    updateStatus('ready', '已停止');
-    updateButtons();
-    log('已停止抢票');
+    // 等待pollState同步状态
+    await new Promise(r => setTimeout(r, 500));
+    log('已发送停止指令');
   } catch (e) {
     log(`停止异常: ${e.message}`, 'error');
   }
@@ -347,10 +385,17 @@ function buildConfig() {
   // anonymous_buy !== 1: 实名制（需要实名人，不需要联系人）
   const isAnonymous = currentTicket && currentTicket.anonymous_buy === 1;
 
-  // 实名制检查
-  if (!isAnonymous && buyerIds.length === 0 && buyerInfo.length === 0) {
-    log('该票种需要实名制，请选择或填写实名人信息', 'error');
-    return null;
+  // 实名制检查：购买人数量必须等于购买张数
+  if (!isAnonymous) {
+    const totalBuyers = buyerIds.length + buyerInfo.length;
+    if (totalBuyers === 0) {
+      log('该票种需要实名制，请选择或填写实名人信息', 'error');
+      return null;
+    }
+    if (totalBuyers !== qty) {
+      log(`实名人数量不匹配：购买${qty}张票，但选择了${totalBuyers}个实名人`, 'error');
+      return null;
+    }
   }
 
   // 联系人信息（匿名购买时才需要）
@@ -373,11 +418,17 @@ function buildConfig() {
     log('下单延迟已调整为最小值 600ms', 'warn');
   }
 
-  // 定时设置
-  let useTimer = els.useTimer.checked;
+  // 模式设置
+  const grabMode = els.grabMode.value; // 'presale' | 'resale'
+
+  // 定时设置（仅预售模式）
+  let useTimer = false;
   let targetTime = null;
-  if (useTimer && els.targetTime.value) {
-    targetTime = new Date(els.targetTime.value).toISOString();
+  if (grabMode === 'presale') {
+    useTimer = els.useTimer.checked;
+    if (useTimer && els.targetTime.value) {
+      targetTime = new Date(els.targetTime.value).toISOString();
+    }
   }
 
   return {
@@ -388,11 +439,13 @@ function buildConfig() {
     buyer_ids: buyerIds,
     buyer_info: buyerInfo,
     contact_info: contactInfo,
+    grab_mode: grabMode,
     use_timer: useTimer,
     target_time: targetTime,
     advance_seconds: parseFloat(els.advanceSeconds.value) || 0.4,
     prep_retry_delay_ms: parseInt(els.prepDelay.value) || 200,
-    purc_retry_delay_ms: purcDelay
+    purc_retry_delay_ms: purcDelay,
+    stock_check_delay_ms: parseInt(els.stockCheckDelay.value) || 30
   };
 }
 
@@ -402,47 +455,61 @@ function updateButtons() {
   els.btnStop.disabled = !isRunning;
 }
 
-// 上次记录的尝试次数
-let lastLoggedAttemptCount = 0;
+// 上次记录的日志索引和状态
+let lastLogIndex = 0;
+let lastPollRunning = false;
+let lastOrderId = null;
+let lastError = null;
 
 // ========== 轮询状态 ==========
 async function pollState() {
   try {
     const state = await sendMessage('getState');
-    if (state) {
-      if (state.isRunning && !isRunning) {
-        isRunning = true;
-        updateButtons();
-        updateStatus('running', '抢票中...');
-      } else if (!state.isRunning && isRunning) {
-        isRunning = false;
-        updateButtons();
-        updateStatus('ready', '就绪');
-      }
+    if (!state) return;
 
-      // 显示尝试次数（每20次输出一次到日志）
-      if (state.attemptCount > 0 && state.attemptCount >= lastLoggedAttemptCount + 20) {
-        log(`已尝试下单 ${state.attemptCount} 次`, 'info');
-        lastLoggedAttemptCount = state.attemptCount;
-      }
+    // 同步运行状态
+    if (state.isRunning && !isRunning) {
+      isRunning = true;
+      updateButtons();
+      updateStatus('running', '抢票中...');
+    } else if (!state.isRunning && isRunning) {
+      isRunning = false;
+      updateButtons();
+      updateStatus('ready', '已停止');
+    }
 
-      if (state.orderId) {
-        log(`订单号: ${state.orderId}`, 'success');
-        updateStatus('success', '抢票成功！');
+    // 同步后台日志（修复日志显示问题）
+    if (state.logs && state.logs.length > lastLogIndex) {
+      for (let i = lastLogIndex; i < state.logs.length; i++) {
+        const entry = state.logs[i];
+        const time = new Date(entry.time).toLocaleTimeString();
+        const div = document.createElement('div');
+        div.className = `log-entry ${entry.type}`;
+        div.textContent = `[${time}] ${entry.msg}`;
+        els.logContainer.appendChild(div);
       }
+      els.logContainer.scrollTop = els.logContainer.scrollHeight;
+      lastLogIndex = state.logs.length;
+    }
 
-      if (state.lastError) {
-        log(`错误: ${state.lastError}`, 'error');
-        updateStatus('error', '出错');
-      }
+    // 订单号（只显示一次）
+    if (state.orderId && state.orderId !== lastOrderId) {
+      lastOrderId = state.orderId;
+      updateStatus('success', '抢票成功！');
+    }
+
+    // 错误（只显示一次新的）
+    if (state.lastError && state.lastError !== lastError) {
+      lastError = state.lastError;
+      updateStatus('error', '出错');
     }
   } catch (e) {
     // 忽略
   }
 }
 
-// 每2秒轮询一次状态
-setInterval(pollState, 2000);
+// 每1秒轮询一次状态
+setInterval(pollState, 1000);
 
 // ========== 初始化 ==========
 log('MyGO Reloaded 已加载');

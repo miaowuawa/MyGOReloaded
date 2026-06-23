@@ -76,18 +76,39 @@
       </div>
     </section>
 
-    <!-- 定时设置 -->
+    <!-- 抢票模式 -->
     <section class="section">
-      <h2>定时设置</h2>
-      <div class="form-group checkbox-group">
-        <input type="checkbox" id="useTimer">
-        <label for="useTimer">启用定时抢票</label>
+      <h2>抢票模式</h2>
+      <div class="form-group">
+        <label for="grabMode">模式选择</label>
+        <select id="grabMode">
+          <option value="presale">预售模式 - 定时开抢</option>
+          <option value="resale">回流模式 - 持续监测库存</option>
+        </select>
       </div>
-      <div class="form-group" id="timerGroup">
-        <label for="targetTime">抢票时间</label>
-        <input type="datetime-local" id="targetTime">
-        <label for="advanceSeconds" style="margin-top: 8px;">提前prepare秒数</label>
-        <input type="number" id="advanceSeconds" value="0.4" step="0.1" min="0" max="5">
+
+      <!-- 预售模式设置 -->
+      <div id="presaleGroup">
+        <div class="form-group checkbox-group">
+          <input type="checkbox" id="useTimer">
+          <label for="useTimer">启用定时抢票</label>
+        </div>
+        <div class="form-group" id="timerGroup">
+          <label for="targetTime">抢票时间</label>
+          <input type="datetime-local" id="targetTime">
+          <label for="advanceSeconds" style="margin-top: 8px;">提前prepare秒数</label>
+          <input type="number" id="advanceSeconds" value="0.4" step="0.1" min="0" max="5">
+        </div>
+        <div class="hint" style="margin-top: 8px;">预售模式将在开票前提前prepare，30分钟未抢到自动切换回流模式</div>
+      </div>
+
+      <!-- 回流模式设置 -->
+      <div id="resaleGroup" class="hidden">
+        <div class="form-group">
+          <label for="stockCheckDelay">库存检测延迟(ms)</label>
+          <input type="number" id="stockCheckDelay" value="30" min="10" max="10000">
+        </div>
+        <div class="hint" style="margin-top: 8px;">回流模式将在主界面持续请求库存接口，检测到放票立即下单</div>
       </div>
     </section>
 
@@ -116,6 +137,67 @@
     <section class="section">
       <h2>运行日志</h2>
       <div class="log-container" id="logContainer"></div>
+    </section>
+
+    <!-- 使用教程 -->
+    <section class="section">
+      <h2>使用教程 / Guide</h2>
+      <div class="guide-content">
+        <details>
+          <summary>📖 中文教程</summary>
+          <div class="guide-text">
+            <h4>加载扩展</h4>
+            <ol>
+              <li>打开 Chrome 扩展管理页面：<code>chrome://extensions/</code></li>
+              <li>开启右上角「开发者模式」</li>
+              <li>点击「加载已解压的扩展程序」</li>
+              <li>选择本项目的 <code>extension</code> 文件夹</li>
+            </ol>
+            <h4>无痕模式启用</h4>
+            <ol>
+              <li>在扩展管理页面找到本扩展</li>
+              <li>点击「详情」</li>
+              <li>开启「在无痕模式下启用」</li>
+            </ol>
+            <h4>使用步骤</h4>
+            <ol>
+              <li>先登录 B 站账号，打开任意会员购页面</li>
+              <li>输入项目 ID，点击「获取票务信息」</li>
+              <li>选择场次和票种，设置购买张数</li>
+              <li>点击「获取实名人列表」，勾选对应数量的实名人</li>
+              <li>根据需要填写联系人信息</li>
+              <li>点击「开始抢票」</li>
+            </ol>
+          </div>
+        </details>
+        <details>
+          <summary>📖 English Guide</summary>
+          <div class="guide-text">
+            <h4>Load Extension</h4>
+            <ol>
+              <li>Open Chrome extensions page: <code>chrome://extensions/</code></li>
+              <li>Turn on "Developer mode" at top right</li>
+              <li>Click "Load unpacked"</li>
+              <li>Select the <code>extension</code> folder</li>
+            </ol>
+            <h4>Enable in Incognito</h4>
+            <ol>
+              <li>Find this extension in extensions page</li>
+              <li>Click "Details"</li>
+              <li>Turn on "Allow in Incognito"</li>
+            </ol>
+            <h4>Usage Steps</h4>
+            <ol>
+              <li>Login to Bilibili and open any mall page</li>
+              <li>Enter Project ID, click "Fetch Ticket Info"</li>
+              <li>Select screen and ticket type, set quantity</li>
+              <li>Click "Fetch Buyers", select exact number of buyers</li>
+              <li>Fill contact info if needed</li>
+              <li>Click "Start" to begin</li>
+            </ol>
+          </div>
+        </details>
+      </div>
     </section>
   </div>
 

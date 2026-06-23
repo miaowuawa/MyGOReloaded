@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MyGO Reloaded - B站会员购抢票助手",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "B站会员购自动抢票插件，支持定时抢票、自动获取实名人",
   "permissions": [
     "storage",
