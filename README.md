@@ -1,5 +1,7 @@
 # MyGOReloaded
 
+guide：https://my.feishu.cn/wiki/JXoYwvjZliK0bJk91PfcKDhvnSb?from=from_copylink
+
 🐱 A helpful tool makes you never MyGO while purchasing tickets from bilibili mall. 📺
 
 Made For Anon Chihaya & Nagasaki Soyo(rin)
