@@ -316,19 +316,48 @@ async function runPrep(tabId, config) {
     });
   } catch (e) {
     console.warn('[BG] prepRequest失败:', e.message);
+    // 同兜底：页面跳转瞬间 content.js 可能断开导致抛错，检测 confirmOrder 跳转
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const u = t && t.url ? t.url : '';
+      if (u.includes('confirmOrder') && u.includes('token=')) {
+        addLog('检测到已跳转至确认订单页（兜底），继续下单流程', 'info');
+        return { status: 'success', url: u };
+      }
+    } catch (_) {}
     return { status: 'retry', msg: '标签页可能已关闭' };
   }
 
   console.log('[BG] prep结果:', prepResult);
 
   if (!prepResult) {
+    // 兜底：prepRequest 无响应，通常是因为 openWindow 未被拦住、页面已整体
+    // 跳转到 confirmOrder（detail 页环境销毁，content.js 无法回传结果）。
+    // 此时检测 tab 是否已落在 confirmOrder URL，是则直接当作 prep 成功，
+    // 提取 token 进入 purc，避免 prep 循环无限重试。
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const u = t && t.url ? t.url : '';
+      console.log('[BG] prep无响应，当前tab URL:', u);
+      if (u.includes('confirmOrder') && u.includes('token=')) {
+        addLog('检测到已跳转至确认订单页（兜底），继续下单流程', 'info');
+        return { status: 'success', url: u };
+      }
+    } catch (e) {
+      console.warn('[BG] 兜底检测tab URL失败:', e.message);
+    }
     return { status: 'retry', msg: '无响应' };
   }
 
   const errno = prepResult.errno;
 
-  // 成功获取token
+  // 成功获取token（页面已跳转）
   if (errno === 0) {
+    // 优先使用 toPayTicket 原生构造的 confirmOrder URL（包含 link_id 等完整参数）
+    if (prepResult.url) {
+      return { status: 'success', url: prepResult.url };
+    }
+    // 兜底：用 token 重新构造
     const token = prepResult.data?.token;
     const ptoken = prepResult.data?.ptoken;
     if (token) {
@@ -337,6 +366,19 @@ async function runPrep(tabId, config) {
       const url = `https://mall.bilibili.com/neul-next/ticket/confirmOrder.html?${query}&noTitleBar=1`;
       return { status: 'success', url };
     }
+  }
+
+  // 处理 ticket_prep.js 返回的特定状态
+  const status = prepResult.status;
+
+  // 未开售 - 等待开售
+  if (status === 'not_for_sale') {
+    return { status: 'not_for_sale', msg: prepResult.msg || '尚未开售' };
+  }
+
+  // 售罄/暂时售罄 - 转回流模式
+  if (status === 'sold_out' || status === 'sold_out_temp') {
+    return { status: 'resale', msg: prepResult.msg || '库存不足' };
   }
 
   // 停止码
@@ -364,7 +406,8 @@ async function runPrep(tabId, config) {
     return { status: 'retry', msg: `需要重试 (errno=${errno})` };
   }
 
-  return { status: 'retry', msg: `未知错误 errno=${errno}` };
+  // 其他未知错误，无限重试
+  return { status: 'retry', msg: prepResult.msg || `未知错误 errno=${errno}` };
 }
 
 // ========== Purc 阶段 ==========
@@ -689,6 +732,15 @@ async function runPrepPurcLoop(tab, config) {
       globalState.isRunning = false;
       notifyEnd(result.msg);
       return;
+    } else if (result.status === 'not_for_sale') {
+      // 未开售，等待一段时间后重试
+      addLog(`未开售: ${result.msg}，等待重试...`, 'info');
+      await sleep(2000);
+    } else if (result.status === 'resale') {
+      // 售罄/暂时售罄，转回流模式
+      addLog(`库存不足: ${result.msg}，切换至回流模式...`, 'warn');
+      await runResaleMode(config);
+      return;
     } else if (result.status === 'refresh') {
       await sendToTab(tab.id, 'refreshStock', { projectId: config.project_id });
       await sleep(config.prep_retry_delay_ms || 200);
@@ -702,6 +754,7 @@ async function runPrepPurcLoop(tab, config) {
         console.warn('[BG] 重新加载页面失败:', e.message);
       }
     } else {
+      // 其他情况（retry 等），继续重试
       await sleep(config.prep_retry_delay_ms || 200);
     }
   }
@@ -737,12 +790,37 @@ async function runPrepPurcLoop(tab, config) {
     }
 
     // 跳转确认订单页
+    addLog('正在跳转确认订单页...', 'info');
     try {
       await chrome.tabs.update(tab.id, { url: prepUrl });
     } catch (e) {
       console.warn('[BG] 跳转确认订单页失败:', e.message);
     }
-    await sleep(2000);
+    
+    // 等待页面加载完成（content.js和ticket_purc.js需要加载）
+    addLog('等待确认订单页加载...', 'info');
+    await sleep(3000);
+    
+    // 等待content.js和injected.js就绪
+    let contentReady = false;
+    for (let i = 0; i < 30; i++) {
+      try {
+        const pingResult = await sendToTab(tab.id, 'checkOrderVmReady');
+        if (pingResult !== null) {
+          contentReady = true;
+          console.log('[BG] 确认订单页内容脚本已就绪');
+          break;
+        }
+      } catch (e) {
+        // 忽略错误，继续等待
+      }
+      await sleep(200);
+    }
+    
+    if (!contentReady) {
+      addLog('确认订单页内容脚本未就绪，重试...', 'warn');
+      continue;
+    }
 
     tab = await getMallTab();
     if (!tab) {
@@ -764,8 +842,9 @@ async function runPrepPurcLoop(tab, config) {
     }
 
     // Purc阶段
+    addLog('开始Purc阶段...', 'info');
     const result = await runPurc(tab.id, config);
-    addLog(`Purc结果: ${result.status}`, 'info');
+    addLog(`Purc结果: ${result?.status || 'undefined'}`, 'info');
 
     if (result.status === 'success') {
       globalState.isRunning = false;

@@ -262,8 +262,10 @@
     // ========== 后台下单循环（非阻塞） ==========
     async function startPurcLoop(vm, clickDelay) {
         if (purcLoopRunning) {
-            console.log('[purc] 下单循环已在运行');
-            return;
+            console.log('[purc] 下单循环已在运行，先停止旧循环');
+            window._purcStop = true;
+            purcLoopRunning = false;
+            await sleep(200); // 等待旧循环停止
         }
         purcLoopRunning = true;
         window._purcStop = false;
@@ -378,15 +380,28 @@
         if (vm && vm.orderId) {
             return { status: 'success', orderId: vm.orderId };
         }
-        if (!purcLoopRunning && !window._purcStop) {
-            return { status: 'stopped', msg: '循环异常停止' };
+        
+        // 检查循环状态
+        // purcLoopRunning 为 true 表示循环正在运行
+        // window._purcStop 为 true 表示循环被要求停止
+        if (!purcLoopRunning) {
+            // 循环未运行，可能是被停止或尚未启动
+            if (window._purcStop) {
+                // 被明确停止
+                return { status: 'stopped', msg: '循环已停止' };
+            } else {
+                // 尚未启动或异常停止
+                return { status: 'stopped', msg: '循环未启动' };
+            }
         }
+        
         return { status: 'running', attempt: window._purcAttempt || 0 };
     };
 
     window.stopPurc = function() {
         window._purcStop = true;
         purcLoopRunning = false;
+        console.log('[purc] 收到停止指令');
     };
 
     window.getOrderVm = function() {
